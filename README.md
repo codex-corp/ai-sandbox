@@ -7,6 +7,9 @@ This script is designed for developers who want to leverage AI assistants on the
 > **Developer Note**
 > Hi, This project came from the need to safely integrate powerful AI tools like Codex and Gemini into complex local development workflows without compromising security or codebase integrity. I hope it helps you work smarter and safer with AI. You can find me on [LinkedIn](https://www.linkedin.com/in/hanyalsamman/).
 
+## Demo
+
+<video src="https://raw.githubusercontent.com/codex-corp/ai-sandbox/main/ai-tool.mp4" width="700" controls></video>
 
 ## Key Features
 
