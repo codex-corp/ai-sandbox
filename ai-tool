@@ -1,0 +1,385 @@
+#!/bin/bash
+#
+# Improved AI CLI Sandbox Runner
+#
+# This script provides a secure and isolated environment to run AI command-line tools
+# like Gemini CLI inside a Docker container. It automatically handles:
+#   - Backing up and redacting secrets from your source code.
+#   - Mounting host authentication/configuration files for seamless CLI usage.
+#   - Running the container with appropriate security sandboxing.
+#   - Providing post-session options to review changes, diff, or restore.
+#
+
+set -euo pipefail
+
+# ===== Script-level Configuration =====
+# --- Colors for better UX ---
+C_RESET='\033[0m'
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_BLUE='\033[0;34m'
+C_CYAN='\033[0;36m'
+
+# --- Defaults ---
+PROJECT_ROOT="$(pwd)"
+SESSION_ID="ai-session-$(date +%Y%m%d-%H%M%S)"
+LOG_DIR="$PROJECT_ROOT/.ai-logs"
+BACKUP_DIR="$PROJECT_ROOT/.ai-backups/$SESSION_ID"
+LOG_FILE="$LOG_DIR/$SESSION_ID.log"
+
+# --- Script Arguments (with defaults) ---
+SCAN_ENABLED=false
+IS_SHELL_SESSION=false
+TOOL="gemini"
+WORKDIR="."
+DOCKER_IMAGE="ai-sandbox"
+DOCKER_NETWORK="${DOCKER_NETWORK:-bridge}"
+SERVICES=()
+TOOL_ARGS=()
+
+# ==============================================================================
+# SCRIPT FUNCTIONS
+# ==============================================================================
+
+# --- Graceful exit on Ctrl+C ---
+cleanup() {
+  echo -e "\n${C_YELLOW}⚠️ Signal received, shutting down...${C_RESET}"
+  # Find and kill the container if it's running
+  if [ -n "$SESSION_ID" ] && docker ps -q --filter "name=$SESSION_ID" | grep -q .; then
+    echo "   Stopping Docker container: $SESSION_ID"
+    docker kill "$SESSION_ID" >/dev/null 2>&1
+  fi
+  echo "👋 Exited cleanly."
+  exit 130 # Standard exit code for Ctrl+C
+}
+
+# --- Display usage information ---
+print_usage() {
+  cat <<EOF
+Usage: $(basename "$0") --services "svc1 svc2" [OPTIONS] [-- <TOOL_ARGS>]
+
+Runs an AI tool or an interactive shell in a sandboxed Docker container.
+
+Required:
+  --services <"svc1 svc2">   List of service directories with write access.
+
+Options:
+  --tool <tool>              AI tool to use. (default: "gemini"; supported: gemini, codex)
+  --shell                    Launch an interactive bash shell instead of an AI tool.
+  --workdir <path>           Working directory inside the container. (default: ".")
+  --image <name>             Docker image to use. (default: "ai-sandbox")
+  --network <name>           Docker network to connect to. (default: "bridge")
+  --gitleaks                 Enable pre-run gitleaks scan on service directories.
+  -- <TOOL_ARGS>             All arguments after '--' are passed directly to the AI tool.
+
+Examples:
+  # Interactive Gemini session on 'api' and 'worker' services
+  $(basename "$0") --services "api worker"
+
+  # Get an interactive shell inside the container
+  $(basename "$0") --services "api" --shell
+
+  # Non-interactive prompt to refactor a file
+  $(basename "$0") --services "worker" -- gemini -p "Refactor this python code"
+EOF
+}
+
+# --- Parse command-line arguments ---
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --services) shift; SERVICES=($1); shift ;;
+      --workdir)  shift; WORKDIR="$1"; shift ;;
+      --tool)     shift; TOOL="$1"; shift ;;
+      --gitleaks) SCAN_ENABLED=true; shift ;;
+      --shell)    IS_SHELL_SESSION=true; shift ;;
+      --image)    shift; DOCKER_IMAGE="$1"; shift ;;
+      --network)  shift; DOCKER_NETWORK="$1"; shift ;;
+      --help|-h)  print_usage; exit 0 ;;
+      --) shift; TOOL_ARGS+=("$@"); break ;;
+      *) echo -e "${C_RED}Unknown option: $1${C_RESET}"; print_usage; exit 1 ;;
+    esac
+  done
+
+  # Validate required arguments
+  [ ${#SERVICES[@]} -gt 0 ] || { echo -e "${C_RED}❌ --services is a required argument.${C_RESET}"; print_usage; exit 1; }
+}
+
+# --- Backup directories and redact secrets from text files ---
+backup_and_redact() {
+  echo -e "${C_BLUE}🧼 Backing up and redacting secrets in services: ${SERVICES[*]}${C_RESET}"
+  local -r SIMPLE_RULES=(
+   's/GEMINI_API_KEY=.*/GEMINI_API_KEY=<REDACTED>/g'
+   's/OPENAI_API_KEY=.*/OPENAI_API_KEY=<REDACTED>/g'
+   's/sk-[a-zA-Z0-9]\{48\}/<OPENAI_API_KEY_REDACTED>/g'
+   's/AIza[0-9A-Za-z_-]\{35\}/<GEMINI_API_KEY_REDACTED>/g'
+   's/[a-f0-9]\{64\}/<HEX_SECRET_REDACTED>/g'
+  )
+
+  for s in "${SERVICES[@]}"; do
+   [ -d "$s" ] || { echo -e "${C_YELLOW}⚠️ Service directory not found, skipping: $s${C_RESET}"; continue; }
+   find "$s" -type f -not -path '*/.git/*' \( \
+     -name "*.php" -o -name "*.py" -o -name "*.js" -o -name "*.ts" -o \
+     -name "*.env*" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" -o \
+     -name "Dockerfile" -o -name "*.md" -o -name "*.toml" -o -name "*.conf" \
+     -name "*.cfg" -o -name "*.ini" -o -name "*.sh" -o -name "*.sql" \
+     -name "*.txt" -o -name "README*" -o -name "LICENSE*" \
+   \) 2>/dev/null | while read -r f; do
+       [ -r "$f" ] || continue
+       mkdir -p "$BACKUP_DIR/$(dirname "$f")"
+       cp "$f" "$BACKUP_DIR/$f"
+       for rule in "${SIMPLE_RULES[@]}"; do
+         sed -i.bak "$rule" "$f" 2>/dev/null || true
+       done
+       rm -f "$f.bak"
+     done
+  done
+  echo -e "${C_GREEN}✅ Redaction complete.${C_RESET}"
+}
+
+# --- Run gitleaks if enabled ---
+run_gitleaks_scan() {
+  if ! command -v gitleaks >/dev/null 2>&1; then
+    echo -e "${C_YELLOW}⚠️ gitleaks command not found, skipping scan.${C_RESET}"
+    return
+  fi
+  echo -e "${C_BLUE}🔍 Scanning target folders with gitleaks...${C_RESET}"
+  local gitleaks_log="$LOG_DIR/$SESSION_ID.gitleaks.log"
+  {
+    for s in "${SERVICES[@]}"; do
+      [ -d "$s" ] && gitleaks detect --source "$s" --no-git --verbose || true
+    done
+  } > "$gitleaks_log" 2>&1
+  if grep -q "leaks found" "$gitleaks_log"; then
+    echo -e "${C_YELLOW}⚠️ Potential leaks found! Review log: $gitleaks_log${C_RESET}"
+  else
+    echo -e "${C_GREEN}✅ No new leaks detected by gitleaks.${C_RESET}"
+    rm -f "$gitleaks_log"
+  fi
+}
+
+# --- Construct the array of Docker volume mount flags ---
+build_docker_mounts() {
+  # 1. Mount the entire project read-only for context.
+  MOUNTS=( -v "$PROJECT_ROOT:/workspace:ro" )
+
+  # 2. Layer read-write mounts ONLY for the specified services.
+  echo -e "${C_BLUE}📝 Granting write access to services: ${SERVICES[*]}${C_RESET}"
+  for s in "${SERVICES[@]}"; do
+    [ -d "$PROJECT_ROOT/$s" ] && MOUNTS+=( -v "$PROJECT_ROOT/$s:/workspace/$s" )
+  done
+
+  # 3. Mount host credentials.
+  # Make sure the host directories exist to prevent Docker from creating them as root.
+  mkdir -p "$HOME/.gemini" "$HOME/.config/gcloud" "$HOME/.codex" "$HOME/.cache/codex"
+  case "$TOOL" in
+    gemini)
+      echo -e "${C_BLUE}🔗 Mounting Gemini configs from host ~/.gemini to container ~/.gemini...${C_RESET}"
+      # Map the user's actual ~/.gemini directory to the same path inside the container.
+      MOUNTS+=( -v "$HOME/.gemini:/home/node/.gemini" -v "$HOME/.config/gcloud:/home/node/.config/gcloud" )
+      ;;
+    codex)
+      echo -e "${C_BLUE}🔗 Mounting Codex configs from ~/.codex...${C_RESET}"
+      MOUNTS+=( -v "$HOME/.codex:/home/node/.codex" -v "$HOME/.codex:/home/node/.config/codex" -v "$HOME/.cache/codex:/home/node/.cache/codex" )
+      ;;
+  esac
+
+  # Apply SELinux label (:Z) if active.
+  if [ -e /sys/fs/selinux/enforce ]; then
+      local TMP_MOUNTS=()
+      for mount in "${MOUNTS[@]}"; do
+        [[ "$mount" == -v* && "$mount" != *:Z ]] && TMP_MOUNTS+=("${mount}:Z") || TMP_MOUNTS+=("$mount")
+      done
+      MOUNTS=("${TMP_MOUNTS[@]}")
+  fi
+}
+
+# --- Prepare and execute the main Docker command ---
+execute_in_docker() {
+  # Verify Docker image exists
+  docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1 || { echo -e "${C_RED}❌ Docker image '$DOCKER_IMAGE' not found. Please build or pull it.${C_RESET}"; exit 3; }
+
+  # --- Determine command and session type ---
+  local final_cmd; local -a final_args=(); local session_type; local is_interactive=false
+  if [ "$IS_SHELL_SESSION" = true ]; then
+    session_type="Interactive Shell"
+    final_cmd="/bin/bash"
+    is_interactive=true
+  else
+    session_type="AI Tool: $TOOL"
+    case "$TOOL" in
+      codex)  final_cmd="codex" ;;
+      gemini) final_cmd="gemini" ;;
+      *) echo -e "${C_RED}❌ Unknown tool: $TOOL${C_RESET}"; exit 2 ;;
+    esac
+    final_args=("${TOOL_ARGS[@]}")
+    # An AI tool is interactive if no arguments are passed.
+    [ ${#TOOL_ARGS[@]} -eq 0 ] && is_interactive=true
+  fi
+
+  # --- Pre-run Summary ---
+  if [ "$is_interactive" = true ]; then # Show summary only for the main interactive session
+    echo -e "${C_CYAN}======================================="
+    echo -e "  Starting AI Sandbox Session"
+    echo -e "=======================================${C_RESET}"
+    printf "  %-20s %s\n" "Session Type:" "$session_type"
+    printf "  %-20s %s\n" "Services (writable):" "${SERVICES[*]}"
+    printf "  %-20s %s\n" "Docker Image:" "$DOCKER_IMAGE"
+    printf "  %-20s %s\n" "Working Directory:" "/workspace/$WORKDIR"
+    echo -e "${C_CYAN}---------------------------------------${C_RESET}"
+  fi
+
+
+  # Log session header to file
+  {
+    echo "================ AI SESSION: $SESSION_ID ================"
+    echo "TIMESTAMP: $(date)"; echo "SESSION_TYPE: $session_type"
+    echo "SERVICES: ${SERVICES[*]}"; echo "ARGS: ${final_args[*]:-}"
+    echo "----------------------------------------------------------"
+  } >> "$LOG_FILE"
+
+  local -a RUN_BASE=(
+    docker run --rm -it --name "$SESSION_ID" --network "$DOCKER_NETWORK"
+    --read-only --tmpfs /tmp:rw,nosuid,noexec --tmpfs /var:rw,nosuid --tmpfs /home/node:rw,nosuid
+    "${MOUNTS[@]}"
+    -w "/workspace/$WORKDIR" -u "$(id -u):$(id -g)"
+    -e HOME=/home/node -e XDG_CACHE_HOME=/home/node/.cache -e XDG_CONFIG_HOME=/home/node/.config
+    -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -e TERM="${TERM:-xterm-256color}"
+    -e COLUMNS="${COLUMNS:-120}" -e LINES="${LINES:-40}"
+    --entrypoint /bin/bash "$DOCKER_IMAGE"
+    -lc 'chown -R "$(id -u):$(id -g)" /home/node/.config /home/node/.cache /home/node/.local /home/node/.gemini 2>/dev/null || true; command -v "$0" >/dev/null 2>&1 || { printf "❌ Command not found in container: %s\\n" "$0" >&2; exit 127; }; exec "$0" "$@"'
+    "$final_cmd" "${final_args[@]}"
+  )
+
+  if [ "$is_interactive" = true ]; then
+    echo -e "${C_GREEN}🚀 Starting interactive session... (Type 'exit' or press Ctrl+D to return to the menu)${C_RESET}"
+    "${RUN_BASE[@]}"
+    local exit_code=$?
+    echo "--- SESSION END (Exit Code: $exit_code) ---" >> "$LOG_FILE"
+    echo -e "${C_GREEN}✅ Interactive session ended.${C_RESET}"
+  else
+    echo -e "${C_GREEN}📜 Running command and logging to $LOG_FILE...${C_RESET}"
+    "${RUN_BASE[@]}" 2>&1 | tee -a "$LOG_FILE"
+    local exit_code=${PIPESTATUS[0]}
+    echo "--- SESSION END (Exit Code: $exit_code) ---" >> "$LOG_FILE"
+    echo -e "${C_GREEN}✅ Command finished.${C_RESET}"
+  fi
+}
+
+# --- Show menu for post-session actions ---
+post_session_menu() {
+  while true; do
+    echo ""
+    echo -e "${C_CYAN}🔄 POST-SESSION OPTIONS:${C_RESET}"
+    echo "   1) Show changed files"
+    echo "   2) Generate git patch for IDE"
+    echo "   3) Re-enter session (shell)"
+    echo "   4) Restore original files from backup"
+    echo "   5) Keep changes and exit"
+    echo "   6) Keep changes and delete backup"
+    echo ""
+    read -p "Choose an option [1-6]: " -n 1 -r REPLY
+    echo
+
+    case $REPLY in
+      1)
+        echo "🔍 Files modified during the session:"
+        local has_changes=false
+        for s in "${SERVICES[@]}"; do
+          if [ -d "$s" ] && [ -d "$BACKUP_DIR/$s" ]; then
+            # Use process substitution to avoid a subshell for the while loop.
+            # This prevents it from consuming stdin meant for the menu's read command.
+            while read -r line; do
+              has_changes=true
+              echo "   - $line"
+            done < <(diff -rq "$BACKUP_DIR/$s" "$s" 2>/dev/null)
+          fi
+        done
+        [ "$has_changes" = false ] && echo "   No changes detected."
+        ;;
+      2)
+        command -v git >/dev/null 2>&1 || { echo -e "${C_RED}❌ git is required for this feature but not found.${C_RESET}"; continue; }
+        local patch_file="$LOG_DIR/$SESSION_ID.patch"
+        echo "📄 Generating git patch to $patch_file..."
+        > "$patch_file"
+        for s in "${SERVICES[@]}"; do
+          [ -d "$s" ] && [ -d "$BACKUP_DIR/$s" ] && git diff --no-index --patch "$BACKUP_DIR/$s" "$s" >> "$patch_file" 2>/dev/null || true
+        done
+        echo -e "${C_GREEN}✅ Patch saved.${C_RESET}"
+        ;;
+      3)
+        # Temporarily override globals to enter a shell session
+        local original_is_shell=$IS_SHELL_SESSION
+        local -a original_tool_args=("${TOOL_ARGS[@]}")
+        IS_SHELL_SESSION=true
+        TOOL_ARGS=()
+        execute_in_docker
+        # Restore globals
+        IS_SHELL_SESSION=$original_is_shell
+        TOOL_ARGS=("${original_tool_args[@]}")
+        ;;
+      4)
+        read -p "Are you sure you want to discard all changes? (y/N) " -n 1 -r CONFIRM
+        echo
+        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+          echo "🔄 Restoring original files..."
+          for s in "${SERVICES[@]}"; do
+            [ -d "$BACKUP_DIR/$s" ] && rsync -a --delete "$BACKUP_DIR/$s"/ "$s"/ && echo "   - Restored $s"
+          done
+          echo -e "${C_GREEN}✅ Restore complete.${C_RESET} Backup is still available at $BACKUP_DIR"
+        else
+          echo "Aborted. Changes have been kept."
+        fi
+        break
+        ;;
+      5)
+        echo -e "👋 Session ended. ${C_YELLOW}Changes kept.${C_RESET} Backup is at: $BACKUP_DIR"
+        break
+        ;;
+      6)
+        read -p "Are you sure you want to permanently delete the backup for this session? (y/N) " -n 1 -r CONFIRM
+        echo
+        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+          echo "🗑️ Deleting backup directory..."
+          rm -rf "$BACKUP_DIR"
+          echo -e "👋 Session ended. ${C_YELLOW}Changes kept and backup removed.${C_RESET}"
+        else
+          echo "Aborted. Backup has been kept at: $BACKUP_DIR"
+        fi
+        break
+        ;;
+      *)
+        echo -e "${C_YELLOW}👋 Invalid option. Please try again.${C_RESET}"
+        ;;
+    esac
+  done
+}
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+main() {
+  # --- Trap signals for graceful shutdown ---
+  trap cleanup INT TERM
+
+  # --- Pre-flight checks ---
+  command -v docker >/dev/null 2>&1 || { echo -e "${C_RED}❌ Docker is not installed or not in PATH. Aborting.${C_RESET}"; exit 1; }
+  command -v rsync >/dev/null 2>&1 || { echo -e "${C_RED}❌ rsync is required for the restore feature but not found.${C_RESET}"; exit 1; }
+
+  parse_args "$@"
+
+  # --- Setup ---
+  mkdir -p "$LOG_DIR" "$BACKUP_DIR"
+
+  # --- Run sequence ---
+  backup_and_redact
+  [ "$SCAN_ENABLED" = true ] && run_gitleaks_scan
+  build_docker_mounts
+  execute_in_docker
+  post_session_menu
+}
+
+# --- Run the main function with all script arguments ---
+main "$@"
+
